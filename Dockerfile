@@ -1,6 +1,10 @@
-FROM python:3.9-slim
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
+    python3-pip \
+    python3-dev \
     gcc \
     git \
     libffi-dev \
@@ -10,12 +14,12 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip && \
-    pip install "setuptools<70.0.0" wheel && \
-    pip install --no-cache-dir ryu eventlet==0.33.3
+RUN pip3 install --upgrade pip
+
+RUN pip3 install ryu eventlet==0.33.3
 
 WORKDIR /app
 
-COPY src/ . 
+COPY src/ .
 
 CMD ["ryu-manager", "main.py"]
