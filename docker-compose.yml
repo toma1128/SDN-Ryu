@@ -1,0 +1,10 @@
+services:
+  ryu:
+    image: ryu-controller
+    build: .
+    volumes:
+      - ./src:/app
+    network_mode: "host"
+    command: ryu-manager main.py
+    stdin_open: true
+    tty: true
