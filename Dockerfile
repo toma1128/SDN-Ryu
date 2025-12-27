@@ -10,7 +10,9 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir ryu eventlet==0.33.3
+RUN pip install --upgrade pip && \
+    pip install "setuptools<70.0.0" wheel && \
+    pip install --no-cache-dir ryu eventlet==0.33.3
 
 WORKDIR /app
 
