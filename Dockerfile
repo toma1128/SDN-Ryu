@@ -3,20 +3,11 @@ FROM ubuntu:20.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
-    python3-pip \
-    python3-dev \
-    gcc \
-    git \
-    libffi-dev \
-    libssl-dev \
-    libxml2-dev \
-    libxslt1-dev \
-    zlib1g-dev \
+    python3-ryu \
+    python3-dnspython \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --upgrade pip
-
-RUN pip3 install ryu eventlet==0.33.3
+RUN pip3 install scapy
 
 WORKDIR /app
 
