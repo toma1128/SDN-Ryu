@@ -27,6 +27,9 @@ class SimpleMonitor(app_manager.RyuApp):
         self.log_cache = {}
         self.query_log = {}
         
+        # 自分(OVS)のIP
+        self.MY_IP = "192.168.0.254"
+        
         # 非同期検索設定
         self.resolve_queue = queue.Queue()
         self.pending_ips = set()
@@ -34,7 +37,7 @@ class SimpleMonitor(app_manager.RyuApp):
         self.worker_thread = threading.Thread(target=self._resolver_loop, daemon=True)
         self.worker_thread.start()
 
-        print("SYSTEM: Active Monitor Mode Started (All Traffic)")
+        print("SYSTEM: Monitor Started")
 
     # 別スレッドでのIP逆引き
     def _resolver_loop(self):
@@ -68,20 +71,18 @@ class SimpleMonitor(app_manager.RyuApp):
                 self.resolve_queue.put(ip)
         return f"({ip})"
 
-    # mDNS質問パケット送信 (職務質問)
+    # mDNS質問パケット送信
     def send_mdns_query(self, datapath, target_ip):
-        # 30秒に1回制限
         now = time.time()
         if target_ip in self.query_log and now - self.query_log[target_ip] < 30:
             return
         self.query_log[target_ip] = now
 
-        # 逆引き用アドレス作成
         rev_ip = ".".join(reversed(target_ip.split("."))) + ".in-addr.arpa"
         
         # srcはOVSのIPを指定して信頼させる
         pkt = Ether(src="02:00:00:00:00:01", dst="01:00:5e:00:00:fb") / \
-              IP(src="192.168.0.254", dst="224.0.0.251") / \
+              IP(src=self.MY_IP, dst="224.0.0.251") / \
               UDP(sport=5353, dport=5353) / \
               DNS(rd=1, qd=DNSQR(qname=rev_ip, qtype='PTR'))
         
@@ -116,13 +117,13 @@ class SimpleMonitor(app_manager.RyuApp):
                     if dns.ancount > 0:
                         for i in range(dns.ancount):
                             rr = dns.an[i]
-                            # A/AAAAレコード
+                            # A/AAAA
                             if rr.type in [1, 28]: 
                                 if hasattr(rr, 'rrname'):
                                     rname = rr.rrname.decode('utf-8', 'ignore')
                                     if rname.endswith('.local.') and not rname.startswith('_'):
                                         found_name = rname.rstrip('.')
-                            # PTRレコード
+                            # PTR
                             elif rr.type == 12: 
                                 if hasattr(rr, 'rdata'):
                                     rdata = rr.rdata.decode('utf-8', 'ignore')
@@ -133,17 +134,21 @@ class SimpleMonitor(app_manager.RyuApp):
                     if found_name and src_mac not in self.mac_to_name:
                         self.mac_to_name[src_mac] = found_name
 
-            # パケット処理
+            # パケットログ出力処理
             if scapy_pkt.haslayer(IP):
                 src_ip = scapy_pkt[IP].src
                 dst_ip = scapy_pkt[IP].dst
                 dst_mac = scapy_pkt.dst
 
+                # 自分自身の通信はログに出さない
+                if src_ip == self.MY_IP or dst_ip == self.MY_IP:
+                    return
+
                 # ノイズ除去
                 if dst_ip.endswith(".255") or dst_ip.startswith("224.") or dst_ip.startswith("239.") or dst_ip == "255.255.255.255":
                     return
 
-                # 名前未学習端末には名前質問を投げる
+                # 未学習端末への質問
                 if src_ip.startswith("192.168.") and src_mac not in self.mac_to_name:
                     self.send_mdns_query(datapath, src_ip)
 
@@ -152,6 +157,7 @@ class SimpleMonitor(app_manager.RyuApp):
                 elif scapy_pkt.haslayer(UDP): protocol = "UDP"
 
                 if protocol:
+                    # DNS通信除外
                     is_dns_traffic = (scapy_pkt.haslayer(UDP) and 
                                      (scapy_pkt[UDP].sport == 53 or scapy_pkt[UDP].dport == 53 or 
                                       scapy_pkt[UDP].sport == 5353 or scapy_pkt[UDP].dport == 5353))
