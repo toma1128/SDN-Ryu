@@ -21,9 +21,8 @@ class SimpleMonitor(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(SimpleMonitor, self).__init__(*args, **kwargs)
         
-        # データ管理
-        self.mac_to_name = {}
-        self.ip_to_domain = {}
+        # データ管理: IPアドレス → 名前
+        self.ip_to_name = {}
         self.log_cache = {}
         self.query_log = {}
         
@@ -37,20 +36,24 @@ class SimpleMonitor(app_manager.RyuApp):
         self.worker_thread = threading.Thread(target=self._resolver_loop, daemon=True)
         self.worker_thread.start()
 
-        print("SYSTEM: Monitor Started")
+        print("SYSTEM: IP-Only Monitor Started (Simple Mode)")
 
-    # 別スレッドでのIP逆引き
+    # IP逆引き
     def _resolver_loop(self):
         while True:
             try:
                 ip_addr = self.resolve_queue.get()
-                try:
-                    hostname, _, _ = socket.gethostbyaddr(ip_addr)
-                    self.ip_to_domain[ip_addr] = hostname
-                except socket.herror:
-                    self.ip_to_domain[ip_addr] = ip_addr 
-                except Exception:
-                    pass
+                # 既にmDNSできれいな名前がわかっているならDNS検索しない
+                if ip_addr in self.ip_to_name and not self.ip_to_name[ip_addr].startswith(ip_addr):
+                    pass 
+                else:
+                    try:
+                        hostname, _, _ = socket.gethostbyaddr(ip_addr)
+                        self.ip_to_name[ip_addr] = hostname
+                    except socket.herror:
+                        pass # 名前がなければ何もしない
+                    except Exception:
+                        pass
                 
                 if ip_addr in self.pending_ips:
                     self.pending_ips.remove(ip_addr)
@@ -60,12 +63,17 @@ class SimpleMonitor(app_manager.RyuApp):
                 pass
 
     # 表示名取得
-    def get_display_name(self, mac, ip):
-        if mac in self.mac_to_name:
-            return f"[{self.mac_to_name[mac]}]"
-        if ip in self.ip_to_domain:
-             return f"({self.ip_to_domain[ip]})"
+    def get_display_name(self, ip):
+        # 知っている名前があればそれを返す
+        if ip in self.ip_to_name:
+            name = self.ip_to_name[ip]
+            if "192.168." in ip:
+                return f"[{name}]"
+            return f"({name})"
+        
+        # 知らなければ検索キューに入れてIPを返す
         if ip not in self.pending_ips:
+            # 外部IPはDNS検索
             if not ip.startswith("192.168."):
                 self.pending_ips.add(ip)
                 self.resolve_queue.put(ip)
@@ -74,13 +82,13 @@ class SimpleMonitor(app_manager.RyuApp):
     # mDNS質問パケット送信
     def send_mdns_query(self, datapath, target_ip):
         now = time.time()
-        if target_ip in self.query_log and now - self.query_log[target_ip] < 30:
+        if target_ip in self.query_log and now - self.query_log[target_ip] < 10:
             return
         self.query_log[target_ip] = now
 
         rev_ip = ".".join(reversed(target_ip.split("."))) + ".in-addr.arpa"
         
-        # srcはOVSのIPを指定して信頼させる
+        # OVSのIPを指定
         pkt = Ether(src="02:00:00:00:00:01", dst="01:00:5e:00:00:fb") / \
               IP(src=self.MY_IP, dst="224.0.0.251") / \
               UDP(sport=5353, dport=5353) / \
@@ -99,57 +107,71 @@ class SimpleMonitor(app_manager.RyuApp):
         datapath = msg.datapath
         try:
             scapy_pkt = Ether(msg.data)
-            src_mac = scapy_pkt.src
             
             # DHCP監視
             if scapy_pkt.haslayer(DHCP):
-                for opt in scapy_pkt[DHCP].options:
-                    if isinstance(opt, tuple) and opt[0] == 'hostname':
-                        name = opt[1].decode('utf-8', 'ignore')
-                        self.mac_to_name[src_mac] = name
-                        break
+                if scapy_pkt.haslayer(IP):
+                    src_ip = scapy_pkt[IP].src
+                    # Requestパケットなどで0.0.0.0の場合は無視
+                    if src_ip != "0.0.0.0":
+                        for opt in scapy_pkt[DHCP].options:
+                            if isinstance(opt, tuple) and opt[0] == 'hostname':
+                                name = opt[1].decode('utf-8', 'ignore')
+                                self.ip_to_name[src_ip] = name
+                                break
 
             # mDNS監視
-            if scapy_pkt.haslayer(UDP) and scapy_pkt[UDP].dport == 5353:
-                if scapy_pkt.haslayer(DNS):
-                    dns = scapy_pkt[DNS]
+            if scapy_pkt.haslayer(UDP) and scapy_pkt[UDP].sport == 5353:
+                if scapy_pkt.haslayer(IP) and scapy_pkt.haslayer(DNS):
+                    src_ip = scapy_pkt[IP].src
+                    dns = scapy_pkt[DNS]                
                     found_name = None
                     if dns.ancount > 0:
                         for i in range(dns.ancount):
                             rr = dns.an[i]
-                            # A/AAAA
-                            if rr.type in [1, 28]: 
-                                if hasattr(rr, 'rrname'):
-                                    rname = rr.rrname.decode('utf-8', 'ignore')
-                                    if rname.endswith('.local.') and not rname.startswith('_'):
-                                        found_name = rname.rstrip('.')
-                            # PTR
-                            elif rr.type == 12: 
-                                if hasattr(rr, 'rdata'):
-                                    rdata = rr.rdata.decode('utf-8', 'ignore')
-                                    if rdata.endswith('.local.') and not rdata.startswith('_'):
-                                        found_name = rdata.rstrip('.')
-                            if found_name: break
+                            candidate = None
+                            
+                            # 名前候補の抽出
+                            if hasattr(rr, 'rdata') and isinstance(rr.rdata, bytes):
+                                try:
+                                    candidate = rr.rdata.decode('utf-8', 'ignore')
+                                except: pass
+                            elif hasattr(rr, 'rrname'):
+                                try:
+                                    candidate = rr.rrname.decode('utf-8', 'ignore')
+                                except: pass
+                            
+                            # フィルタリング
+                            if candidate:
+                                if ('._tcp' in candidate or 
+                                    '._udp' in candidate or 
+                                    '_sub' in candidate or
+                                    '@' in candidate):
+                                    continue
+                                
+                                # .local で終わる名前を採用
+                                if candidate.endswith('.local.'):
+                                    found_name = candidate.rstrip('.')
+                                    break
                     
-                    if found_name and src_mac not in self.mac_to_name:
-                        self.mac_to_name[src_mac] = found_name
+                    if found_name:
+                        self.ip_to_name[src_ip] = found_name
 
-            # パケットログ出力処理
+            # パケットログ出力
             if scapy_pkt.haslayer(IP):
                 src_ip = scapy_pkt[IP].src
                 dst_ip = scapy_pkt[IP].dst
-                dst_mac = scapy_pkt.dst
-
-                # 自分自身の通信はログに出さない
+                
+                # 自分自身の通信は無視
                 if src_ip == self.MY_IP or dst_ip == self.MY_IP:
                     return
 
                 # ノイズ除去
-                if dst_ip.endswith(".255") or dst_ip.startswith("224.") or dst_ip.startswith("239.") or dst_ip == "255.255.255.255":
+                if dst_ip.endswith(".255") or dst_ip.startswith("224.") or dst_ip.startswith("239."):
                     return
 
-                # 未学習端末への質問
-                if src_ip.startswith("192.168.") and src_mac not in self.mac_to_name:
+                # 名前を知らない端末があったらホスト名を聞く
+                if src_ip.startswith("192.168.") and src_ip not in self.ip_to_name:
                     self.send_mdns_query(datapath, src_ip)
 
                 protocol = ""
@@ -164,11 +186,11 @@ class SimpleMonitor(app_manager.RyuApp):
                     
                     if not is_dns_traffic:
                         current_time = time.time()
-                        cache_key = (src_mac, dst_ip, protocol) 
+                        cache_key = (src_ip, dst_ip, protocol) 
                         
                         if current_time - self.log_cache.get(cache_key, 0) > 2.0:
-                            src_show = self.get_display_name(src_mac, src_ip)
-                            dst_show = self.get_display_name(dst_mac, dst_ip)
+                            src_show = self.get_display_name(src_ip)
+                            dst_show = self.get_display_name(dst_ip)
                             
                             print(f"{src_show} -> {dst_show} | {protocol}")
                             self.log_cache[cache_key] = current_time
